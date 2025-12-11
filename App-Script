@@ -1,0 +1,207 @@
+/************************************
+ * Clockify → WP Umbrella: Custom Work
+************************************/
+
+const WP_UMBRELLA_API_KEY = "1051d05695259a3e94599f79bc3d3c41c98251568449";
+
+// CONFIG – adjust names if yours differ
+const CLOCKIFY_SHEET_NAME = 'Clockify_Export';
+const MAPPING_SHEET_NAME  = 'WpSites';
+
+/**
+ * Adds a "WP Umbrella" menu to the spreadsheet.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('WP Umbrella')
+    .addItem('Import Clockify entries', 'importClockifyToWpUmbrella')
+    .addToUi();
+}
+
+/**
+ * Main entry: read Clockify rows, map to WP Umbrella projects,
+ * and create Custom Work entries.
+ */
+function importClockifyToWpUmbrella() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CLOCKIFY_SHEET_NAME);
+  const mappingSheet = ss.getSheetByName(MAPPING_SHEET_NAME);
+
+  if (!sheet) {
+    throw new Error(`Sheet "${CLOCKIFY_SHEET_NAME}" not found.`);
+  }
+  if (!mappingSheet) {
+    throw new Error(`Sheet "${MAPPING_SHEET_NAME}" not found.`);
+  }
+
+  const dataRange = sheet.getDataRange();
+  const values = dataRange.getValues();
+  if (values.length < 2) {
+    Logger.log('No data rows found.');
+    return;
+  }
+
+  const header = values[0];
+  const rows = values.slice(1);
+
+  // Column indices (0-based)
+  const col = {
+    project:          header.indexOf('Project'),
+    client:           header.indexOf('Client'),
+    description:      header.indexOf('Description'),
+    user:             header.indexOf('User'),
+    tags:             header.indexOf('Tags'),
+    billable:         header.indexOf('Billable'),
+    startDate:        header.indexOf('Start Date'),
+    durationDecimal:  header.indexOf('Duration (decimal)'),
+    status:           header.indexOf('Status')
+  };
+
+  // Ensure Status column exists – if not, add it to the end
+  if (col.status === -1) {
+    const lastCol = header.length;
+    sheet.getRange(1, lastCol + 1).setValue('Status');
+    col.status = lastCol; // new index at end (0-based)
+  }
+
+  // Build mapping: Clockify Project → WP Project ID
+  const projectLookup = buildProjectLookup(mappingSheet);
+
+  const timezone = Session.getScriptTimeZone() || 'America/Phoenix';
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const sheetRowNumber = i + 2; // +2 because header is row 1
+
+    const currentStatus = row[col.status] || '';
+    if (currentStatus === 'Imported') {
+      continue; // already processed
+    }
+
+    const projectName = valueOrEmpty(row[col.project]);
+    const description = valueOrEmpty(row[col.description]);
+    const client      = col.client   !== -1 ? valueOrEmpty(row[col.client])   : '';
+    const user        = col.user     !== -1 ? valueOrEmpty(row[col.user])     : '';
+    const tags        = col.tags     !== -1 ? valueOrEmpty(row[col.tags])     : '';
+    const billable    = col.billable !== -1 ? valueOrEmpty(row[col.billable]) : '';
+    const startDate   = row[col.startDate];
+    const durationDec = Number(row[col.durationDecimal]);
+
+    // Look up WP Umbrella project ID
+    const wpProjectId = projectLookup[projectName];
+
+    // Explicit SKIP entries in WpSites (e.g., Admin / non-maintenance work)
+    if (wpProjectId === 'SKIP') {
+      setStatus(sheet, sheetRowNumber, col.status, 'Skipped');
+      console.log(`Row ${sheetRowNumber} | Project ${projectName} | SKIPPED (mapped to SKIP)`);
+      continue;
+    }
+
+    // No mapping found
+    if (!wpProjectId) {
+      setStatus(sheet, sheetRowNumber, col.status, 'No WP mapping');
+      console.log(`Row ${sheetRowNumber} | Project ${projectName} | No WP mapping`);
+      continue;
+    }
+
+    // Basic validation
+    if (!startDate || !durationDec || !description) {
+      setStatus(sheet, sheetRowNumber, col.status, 'Missing data');
+      console.log(`Row ${sheetRowNumber} | Project ${projectName} | Missing data`);
+      continue;
+    }
+
+    // Convert hours (decimal) -> minutes (integer)
+    const minutes = Math.round(durationDec * 60);
+
+    // Date for WP Umbrella (date-only, yyyy-MM-dd)
+    const dateStr = Utilities.formatDate(new Date(startDate), timezone, 'yyyy-MM-dd');
+
+    // Build task description (you can tweak this format)
+    const taskText = `${description}`;
+
+    const payload = {
+      date: dateStr,
+      duration: minutes,
+      task: taskText
+    };
+
+    try {
+      const response = UrlFetchApp.fetch(
+        `https://api.wp-umbrella.com/projects/${wpProjectId}/works`,
+        {
+          method: 'post',
+          headers: {
+            Authorization: `Bearer ${WP_UMBRELLA_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true
+        }
+      );
+
+      const statusCode = response.getResponseCode();
+      const body = response.getContentText();
+
+      // Log full context for debugging
+      console.log(
+        `Row ${sheetRowNumber} | Project ${projectName} | WP Project ID ${wpProjectId} | HTTP ${statusCode} | Body: ${body.substring(0, 300)}`
+      );
+
+      if (statusCode === 201 || statusCode === 200) {
+        setStatus(sheet, sheetRowNumber, col.status, 'Imported');
+      } else {
+        setStatus(sheet, sheetRowNumber, col.status, `Error ${statusCode}`);
+      }
+    } catch (err) {
+      console.error(
+        `Row ${sheetRowNumber} | Project ${projectName} | Exception: ${err}`
+      );
+      setStatus(sheet, sheetRowNumber, col.status, 'Exception');
+    }
+  }
+}
+
+/**
+ * Build a lookup object from mapping sheet:
+ * "Clockify Project" (col A) → "WP Project ID" (col B)
+ */
+function buildProjectLookup(mappingSheet) {
+  const data = mappingSheet.getDataRange().getValues();
+  if (data.length < 2) return {};
+
+  const header = data[0];
+  const rows = data.slice(1);
+
+  const colProject  = header.indexOf('Clockify Project');
+  const colWpId     = header.indexOf('WP Project ID');
+
+  if (colProject === -1 || colWpId === -1) {
+    throw new Error('Mapping sheet must have "Clockify Project" and "WP Project ID" headers.');
+  }
+
+  const map = {};
+  rows.forEach(row => {
+    const projectName = valueOrEmpty(row[colProject]);
+    const wpId        = row[colWpId];
+    if (projectName && wpId) {
+      map[projectName] = wpId;
+    }
+  });
+
+  return map;
+}
+
+/**
+ * Helper: write status into the Status column.
+ */
+function setStatus(sheet, rowNumber, statusColIndex, value) {
+  sheet.getRange(rowNumber, statusColIndex + 1).setValue(value);
+}
+
+/**
+ * Helper: avoid undefined/null noise.
+ */
+function valueOrEmpty(val) {
+  return (val === null || val === undefined) ? '' : String(val);
+}
