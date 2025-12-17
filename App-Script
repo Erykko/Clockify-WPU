@@ -1,6 +1,10 @@
 /************************************
  * Clockify → WP Umbrella: Custom Work
+ * NOW USES CLOUDFLARE WORKER PROXY
 ************************************/
+
+// REPLACE THIS with your Cloudflare Worker URL
+const PROXY_URL = 'https://wp-umbrella-proxy.service-2c4.workers.dev/';
 
 const WP_UMBRELLA_API_KEY = "1051d05695259a3e94599f79bc3d3c41c98251568449";
 
@@ -127,31 +131,17 @@ function importClockifyToWpUmbrella() {
     };
 
     try {
-      const response = UrlFetchApp.fetch(
-        `https://api.wp-umbrella.com/projects/${wpProjectId}/works`,
-        {
-          method: 'post',
-          headers: {
-            Authorization: `Bearer ${WP_UMBRELLA_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          payload: JSON.stringify(payload),
-          muteHttpExceptions: true
-        }
-      );
+      // ⭐ NEW: Call via Cloudflare Worker proxy instead of direct API call
+      const response = callWpUmbrellaViaProxy(wpProjectId, payload);
 
-      const statusCode = response.getResponseCode();
-      const body = response.getContentText();
-
-      // Log full context for debugging
       console.log(
-        `Row ${sheetRowNumber} | Project ${projectName} | WP Project ID ${wpProjectId} | HTTP ${statusCode} | Body: ${body.substring(0, 300)}`
+        `Row ${sheetRowNumber} | Project ${projectName} | WP Project ID ${wpProjectId} | Success: ${response.success}`
       );
 
-      if (statusCode === 201 || statusCode === 200) {
+      if (response.success) {
         setStatus(sheet, sheetRowNumber, col.status, 'Imported');
       } else {
-        setStatus(sheet, sheetRowNumber, col.status, `Error ${statusCode}`);
+        setStatus(sheet, sheetRowNumber, col.status, `Error ${response.status}`);
       }
     } catch (err) {
       console.error(
@@ -160,6 +150,34 @@ function importClockifyToWpUmbrella() {
       setStatus(sheet, sheetRowNumber, col.status, 'Exception');
     }
   }
+}
+
+/**
+ * ⭐ NEW FUNCTION: Call WP Umbrella API via Cloudflare Worker proxy
+ */
+function callWpUmbrellaViaProxy(wpProjectId, payload) {
+  const proxyPayload = {
+    apiKey: WP_UMBRELLA_API_KEY,
+    endpoint: `/projects/${wpProjectId}/works`,
+    method: 'POST',
+    body: payload
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    payload: JSON.stringify(proxyPayload)
+  };
+
+  const response = UrlFetchApp.fetch(PROXY_URL, options);
+  const result = JSON.parse(response.getContentText());
+
+  if (!result.success) {
+    throw new Error(`Proxy Error: ${result.error || result.status}`);
+  }
+
+  return result;
 }
 
 /**
